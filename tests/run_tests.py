@@ -13,5 +13,6 @@ if result.returncode != 0:
     print("Docker build failed", file=sys.stderr)
     sys.exit(1)
 
-run_command = ['docker', 'run', '-it', 'test']
-subprocess.run(run_command)
+run_command = ['docker', 'run', 'test']
+result = subprocess.run(run_command)
+sys.exit(result.returncode)
