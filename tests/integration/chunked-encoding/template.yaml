@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Synthetic integration test: detect whether AL2023 Lambda Runtime API
+  returns Transfer-Encoding: chunked or Content-Length for /invocation/next.
+  All resources are self-contained; stack delete cleans everything up.
+
+Parameters:
+  TestPayloadSizes:
+    Type: String
+    Default: "1024,102400,1048576,5242880,6291456"
+    Description: Comma-separated payload sizes in bytes to test
+
+Resources:
+
+  # ---------------------------------------------------------------
+  # S3 bucket to hold the bootstrap zip
+  # ---------------------------------------------------------------
+  BootstrapBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bootstrap-${AWS::AccountId}"
+
+  # ---------------------------------------------------------------
+  # IAM role for the BootstrapBuilder Lambda
+  # ---------------------------------------------------------------
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BootstrapBucket.Arn
+                  - !Sub "${BootstrapBucket.Arn}/*"
+
+  # ---------------------------------------------------------------
+  # BootstrapBuilder: creates a zip with raw-socket bootstrap, uploads to S3
+  # On delete: empties the S3 bucket
+  # ---------------------------------------------------------------
+  BuilderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-builder"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt BuilderRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BootstrapBucket
+      Code:
+        ZipFile: |
+          import os, io, zipfile, stat, json, boto3
+          import cfnresponse
+
+          BOOTSTRAP_SCRIPT = '''#!/bin/bash
+          # Bootstrap for provided.al2023 — uses curl to inspect Runtime API headers.
+          # curl -D captures raw response headers (including Transfer-Encoding)
+          # while transparently handling chunked decoding for the body.
+          set -euo pipefail
+
+          RUNTIME_API="$AWS_LAMBDA_RUNTIME_API"
+
+          while true; do
+              HDRS=$(mktemp)
+              BODY=$(mktemp)
+
+              # GET next invocation — dump headers to file, body to file
+              curl -sS -D "$HDRS" -o "$BODY" \
+                  "http://${RUNTIME_API}/2018-06-01/runtime/invocation/next"
+
+              # Extract request ID from headers
+              REQUEST_ID=$(grep -oi "lambda-runtime-aws-request-id: [^[:space:]]*" "$HDRS" | head -1 | cut -d" " -f2 | tr -d "\\r\\n")
+
+              # Check for Transfer-Encoding header
+              TE=$(grep -oi "^transfer-encoding: [^[:space:]]*" "$HDRS" | head -1 | cut -d" " -f2 | tr -d "\\r\\n" || true)
+              [ -z "$TE" ] && TE="NOT_PRESENT"
+
+              # Check for Content-Length header
+              CL=$(grep -oi "^content-length: [^[:space:]]*" "$HDRS" | head -1 | cut -d" " -f2 | tr -d "\\r\\n" || true)
+              [ -z "$CL" ] && CL="NOT_PRESENT"
+
+              # Status line
+              STATUS=$(head -1 "$HDRS" | tr -d "\\r\\n")
+
+              # Body length (of decoded body)
+              BODY_LEN=$(stat -c %s "$BODY")
+
+              # Collect all headers as pipe-delimited string for reporting
+              RAW_HDRS=$(tail -n +2 "$HDRS" | tr -d "\\r" | grep -v "^$" | tr "\\n" "|" || true)
+
+              # Build JSON response — only simple ASCII values, safe to interpolate
+              printf -v RESPONSE '{"transfer_encoding":"%s","content_length":"%s","body_length":%d,"raw_status_line":"%s","raw_headers":"%s"}' \
+                  "$TE" "$CL" "$BODY_LEN" "$STATUS" "$RAW_HDRS"
+
+              # POST response back to Runtime API
+              curl -sS -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "$RESPONSE" \
+                  "http://${RUNTIME_API}/2018-06-01/runtime/invocation/${REQUEST_ID}/response"
+
+              rm -f "$HDRS" "$BODY"
+          done
+          '''
+
+          s3 = boto3.client("s3")
+
+          def handler(event, context):
+              bucket = os.environ["BUCKET_NAME"]
+              request_type = event.get("RequestType", "")
+
+              try:
+                  if request_type == "Delete":
+                      # Empty the bucket so CF can delete it
+                      paginator = s3.get_paginator("list_objects_v2")
+                      for page in paginator.paginate(Bucket=bucket):
+                          for obj in page.get("Contents", []):
+                              s3.delete_object(Bucket=bucket, Key=obj["Key"])
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  # Create or Update: build and upload the bootstrap zip
+                  buf = io.BytesIO()
+                  with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                      info = zipfile.ZipInfo("bootstrap")
+                      info.external_attr = (stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP |
+                                            stat.S_IROTH | stat.S_IXOTH) << 16
+                      zf.writestr(info, BOOTSTRAP_SCRIPT)
+                  buf.seek(0)
+                  s3.put_object(Bucket=bucket, Key="bootstrap.zip", Body=buf.read())
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"BucketName": bucket, "Key": "bootstrap.zip"})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  BootstrapResource:
+    Type: Custom::BootstrapBuilder
+    DependsOn: BootstrapBucket
+    Properties:
+      ServiceToken: !GetAtt BuilderFunction.Arn
+
+  # ---------------------------------------------------------------
+  # IAM role for the Probe Lambda
+  # ---------------------------------------------------------------
+  ProbeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ---------------------------------------------------------------
+  # Probe Lambda: provided.al2023 using our raw-socket bootstrap
+  # ---------------------------------------------------------------
+  ProbeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: BootstrapResource
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-probe"
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt ProbeRole.Arn
+      Code:
+        S3Bucket: !Ref BootstrapBucket
+        S3Key: bootstrap.zip
+
+  # ---------------------------------------------------------------
+  # IAM role for the TestRunner Lambda
+  # ---------------------------------------------------------------
+  RunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeProbe
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ProbeFunction.Arn
+
+  # ---------------------------------------------------------------
+  # TestRunner: invokes the Probe with various payload sizes
+  # ---------------------------------------------------------------
+  RunnerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-runner"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt RunnerRole.Arn
+      Environment:
+        Variables:
+          PROBE_FUNCTION_NAME: !Ref ProbeFunction
+          PAYLOAD_SIZES: !Ref TestPayloadSizes
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          import cfnresponse
+
+          client = boto3.client("lambda")
+
+          def handler(event, context):
+              request_type = event.get("RequestType", "")
+              if request_type == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              probe_name = os.environ["PROBE_FUNCTION_NAME"]
+              sizes = [int(s) for s in os.environ["PAYLOAD_SIZES"].split(",")]
+              results = {}
+
+              for size in sizes:
+                  label = format_size(size)
+                  try:
+                      # Build a JSON payload of approximately the requested size
+                      # Use a repeated character string inside a JSON object
+                      padding = "X" * max(0, size - 20)  # subtract overhead for {"d":"..."}
+                      payload = json.dumps({"d": padding})
+                      resp = client.invoke(
+                          FunctionName=probe_name,
+                          InvocationType="RequestResponse",
+                          Payload=payload.encode(),
+                      )
+                      resp_payload = json.loads(resp["Payload"].read())
+                      results[label] = resp_payload
+                  except Exception as e:
+                      results[label] = {"error": str(e)}
+
+              # Log full results to CloudWatch (no size limit)
+              print("FULL_RESULTS:", json.dumps(results))
+
+              # Build a compact summary for CF outputs
+              # Custom resource Data is limited to ~4096 bytes total
+              summary = {}
+              for label, r in results.items():
+                  summary[label] = {
+                      "transfer_encoding": r.get("transfer_encoding", "?"),
+                      "content_length": r.get("content_length", "?"),
+                      "body_length": r.get("body_length", "?"),
+                  }
+
+              summary_json = json.dumps(summary)
+              full_json = json.dumps(results)
+              # Truncate full results if combined size exceeds safe limit
+              max_full = 3500 - len(summary_json)
+              if len(full_json) > max_full:
+                  full_json = full_json[:max_full] + "...(truncated, see CloudWatch)"
+
+              data = {
+                  "Summary": summary_json,
+                  "FullResults": full_json,
+              }
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, data)
+
+          def format_size(n):
+              if n >= 1048576:
+                  return f"{n // 1048576}MB"
+              elif n >= 1024:
+                  return f"{n // 1024}KB"
+              return f"{n}B"
+
+  TestRunnerResource:
+    Type: Custom::TestRunner
+    DependsOn: ProbeFunction
+    Properties:
+      ServiceToken: !GetAtt RunnerFunction.Arn
+
+  # ---------------------------------------------------------------
+  # Outputs: test results surfaced directly in CloudFormation
+  # ---------------------------------------------------------------
+Outputs:
+  TestSummary:
+    Description: "Per-size encoding summary (transfer_encoding, content_length, body_length)"
+    Value: !GetAtt TestRunnerResource.Summary
+  TestFullResults:
+    Description: "Full results JSON including all headers"
+    Value: !GetAtt TestRunnerResource.FullResults

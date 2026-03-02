@@ -3,11 +3,11 @@
 
 #ifndef RELEASE
 #define DEBUG(...) fprintf(stderr, __VA_ARGS__)
-#define FATAL(COND, MSG) { if(COND) { LOG(MSG); exit(-1); } }
 #else
 #define DEBUG(...)
-#define FATAL(COND, MSG)
 #endif
+
+#define FATAL(COND, MSG) { if(COND) { LOG(MSG); exit(-1); } }
 
 #define MAX_REQUEST_SIZE 6 * 1048576
 #define MAX_RESPONSE_SIZE 6 * 1048576

@@ -179,6 +179,7 @@ static void http(const runtime *rt, const char *path, const char *method, const 
                 {
                     if (!chunk_end) {
                         FATAL(content_length < 0, "Missing Content-Length header.");
+                        FATAL(content_length > MAX_REQUEST_SIZE, "Buffer overflow");
                         body_start = parse_point + 1;
                         remain = content_length - ((response + total_bytes_received) - body_start);
                         DEBUG("BODY START: %p, remain=%d\n", body_start, remain);
@@ -200,26 +201,28 @@ static void http(const runtime *rt, const char *path, const char *method, const 
                         exit(0);
                     }
                 }
-                else if (!strncmp(line_start, "Content-Length:", delimiter - line_start))
+                else if (!strncasecmp(line_start, "Content-Length:", delimiter - line_start))
                 {
                     content_length = atoi(delimiter + 2);
                     DEBUG("HEADER Content-Length: %d\n", content_length);
                 }
-                else if (!strncmp(line_start, "Lambda-Runtime-Aws-Request-Id:", delimiter - line_start))
+                else if (!strncasecmp(line_start, "Lambda-Runtime-Aws-Request-Id:", delimiter - line_start))
                 {
                     hb->awsRequestId.data = delimiter + 2;
                     hb->awsRequestId.len = (parse_point - hb->awsRequestId.data) - 1;
                     DEBUG("HEADER Lambda-Runtime-Aws-Request-Id: [%.*s]\n", (int) hb->awsRequestId.len, hb->awsRequestId.data);
                 }
-                else if (!strncmp(line_start, "Transfer-Encoding: chunked", parse_point - line_start))
+                else if (!strncasecmp(line_start, "Transfer-Encoding:", delimiter - line_start + 1))
                 {
-                    chunk_end = parse_point;
-                    DEBUG("HEADER Transfer-Encoding: chunked\n");
-                }
-                else if (!strncmp(line_start, "Transfer-Encoding: chunked", parse_point - 1 - line_start))
-                {
-                    chunk_end = parse_point;
-                    DEBUG("HEADER Transfer-Encoding: chunked\n");
+                    // Value starts after ": ", ends before \r\n; trim trailing whitespace
+                    char *val = delimiter + 2;
+                    char *val_end = parse_point - 1; // skip \r
+                    while (val_end > val && val_end[-1] == ' ') val_end--;
+                    if (val_end - val == 7 && !strncasecmp(val, "chunked", 7))
+                    {
+                        chunk_end = parse_point;
+                        DEBUG("HEADER Transfer-Encoding: chunked\n");
+                    }
                 }
                 line_start = parse_point + 1;
                 delimiter = NULL;
