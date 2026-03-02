@@ -1,5 +1,7 @@
+#ifndef __APPLE__
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,8 +131,14 @@ static void http(const runtime *rt, const char *path, const char *method, const 
     int content_length = -1;
     int remain = INCOMING_LAMBDA_REQUEST_BUFFER_SIZE;
     char *delimiter = NULL;
+    char *chunk_start = NULL;
+    char *chunk_end = NULL;
+    char *chunk_move = NULL;
     hb->body.data = NULL;
     hb->awsRequestId.data = NULL;
+
+    enum parser_state {state_header, state_body, state_chunk};
+    enum parser_state state = state_header;
 
     while (remain)
     {
@@ -151,59 +159,110 @@ static void http(const runtime *rt, const char *path, const char *method, const 
 
             total_bytes_received += bytes_received;
             remain -= bytes_received;
-            if (body_start != NULL)
+            if (body_start != NULL && state == state_body)
             {
                 parse_point += bytes_received;
-                continue;
             }
-        }
-        if (*parse_point == ':')
-        {
-            delimiter = parse_point;
-        }
-        else if (*parse_point == '\n')
-        {
-            FATAL(parse_point - response < 3, "Unexpected linebreak before HTTP headers");
-            FATAL(parse_point[-1] != '\r', "Malformed linebreak: no \\r before \\n");
-            if (parse_point[-2] == '\n')
-            {
-                FATAL(content_length < 0, "Missing Content-Length header.");
-                body_start = parse_point + 1;
-                remain = content_length - ((response + total_bytes_received) - body_start);
-                DEBUG("BODY START: %p, remain=%d\n", body_start, remain);
-                parse_point = response + total_bytes_received;
-                continue;
-            }
-            if (delimiter == NULL)
-            {
-                if (!memcmp(line_start, "HTTP/1.0 410", 12))
-                {
-                    DEBUG("410 (shutting down)\n"); // for testing only
-                    exit(0);
-                }
-            }
-            else if (!strncmp(line_start, "Content-Length:", delimiter - line_start))
-            {
-                content_length = atoi(delimiter + 2);
-                DEBUG("HEADER Content-Length: %d\n", content_length);
-            }
-            else if (!strncmp(line_start, "Lambda-Runtime-Aws-Request-Id:", delimiter - line_start))
-            {
-                hb->awsRequestId.data = delimiter + 2;
-                hb->awsRequestId.len = (parse_point - hb->awsRequestId.data) - 1;
-                DEBUG("HEADER Lambda-Runtime-Aws-Request-Id: [%.*s]\n", (int) hb->awsRequestId.len, hb->awsRequestId.data);
-            }
-            line_start = parse_point + 1;
-            delimiter = NULL;
         }
 
-        ++parse_point;
+        if (state == state_header)
+        {
+            if (*parse_point == ':')
+            {
+                delimiter = parse_point;
+            }
+            else if (*parse_point == '\n')
+            {
+                FATAL(parse_point - response < 3, "Unexpected linebreak before HTTP headers");
+                FATAL(parse_point[-1] != '\r', "Malformed linebreak: no \\r before \\n");
+                if (parse_point[-2] == '\n')
+                {
+                    if (!chunk_end) {
+                        FATAL(content_length < 0, "Missing Content-Length header.");
+                        body_start = parse_point + 1;
+                        remain = content_length - ((response + total_bytes_received) - body_start);
+                        DEBUG("BODY START: %p, remain=%d\n", body_start, remain);
+                        parse_point = response + total_bytes_received;
+                        state = state_body;
+                        continue;
+                    } else {
+                        body_start = parse_point + 1;
+                        chunk_end = body_start;
+                        chunk_move = body_start;
+                        state = state_chunk;
+                    }
+                }
+                if (delimiter == NULL)
+                {
+                    if (!memcmp(line_start, "HTTP/1.0 410", 12))
+                    {
+                        DEBUG("410 (shutting down)\n"); // for testing only
+                        exit(0);
+                    }
+                }
+                else if (!strncmp(line_start, "Content-Length:", delimiter - line_start))
+                {
+                    content_length = atoi(delimiter + 2);
+                    DEBUG("HEADER Content-Length: %d\n", content_length);
+                }
+                else if (!strncmp(line_start, "Lambda-Runtime-Aws-Request-Id:", delimiter - line_start))
+                {
+                    hb->awsRequestId.data = delimiter + 2;
+                    hb->awsRequestId.len = (parse_point - hb->awsRequestId.data) - 1;
+                    DEBUG("HEADER Lambda-Runtime-Aws-Request-Id: [%.*s]\n", (int) hb->awsRequestId.len, hb->awsRequestId.data);
+                }
+                else if (!strncmp(line_start, "Transfer-Encoding: chunked", parse_point - line_start))
+                {
+                    chunk_end = parse_point;
+                    DEBUG("HEADER Transfer-Encoding: chunked\n");
+                }
+                else if (!strncmp(line_start, "Transfer-Encoding: chunked", parse_point - 1 - line_start))
+                {
+                    chunk_end = parse_point;
+                    DEBUG("HEADER Transfer-Encoding: chunked\n");
+                }
+                line_start = parse_point + 1;
+                delimiter = NULL;
+            }
+
+            ++parse_point;
+        }
+        else if (state == state_chunk && parse_point < response + total_bytes_received)
+        {
+            if (*parse_point == '\n')
+            {
+                if (chunk_start && chunk_end) {
+                    memmove(chunk_move, chunk_start, chunk_end - chunk_start);
+                    chunk_move += chunk_end - chunk_start;
+                }
+
+                chunk_start = parse_point + 1;
+                long chunk_size = strtol(chunk_end, NULL, 16);
+                DEBUG("Chunk size: %ld\n", chunk_size);
+
+                if (!chunk_size)
+                {
+                    break;
+                }
+
+                chunk_end = chunk_start + chunk_size;
+                parse_point = chunk_end + 2; // 2 for terminating crlf
+            } else {
+                ++parse_point;
+            }
+        }
     }
     DEBUG("Total bytes received: %d\n", total_bytes_received);
-    response[total_bytes_received] = '\0';
-    hb->buffer.len = total_bytes_received;
     hb->body.data = body_start;
-    hb->body.len = total_bytes_received - (body_start - response);
+    if (state == state_body) {
+        response[total_bytes_received] = '\0';
+        hb->buffer.len = total_bytes_received;
+        hb->body.len = total_bytes_received - (body_start - response);
+    } else if (state == state_chunk) {
+        *chunk_move = '\0';
+        hb->buffer.len = chunk_move - response;
+        hb->body.len = chunk_move - body_start;
+    }
     close(sockfd);
     DEBUG("Response received\n");
 }
